@@ -30,11 +30,13 @@ final class FleetEvolutionClient {
 
     // MARK: - Supabase Config
 
-    private let supabaseURL: String = {
-        ProcessInfo.processInfo.environment["SUPABASE_URL"] ?? "https://YOUR_PROJECT.supabase.co"
-    }()
+    private let supabaseURL = "https://aaqbofotpchgpyuohmmz.supabase.co"
     private let supabaseKey: String = {
-        ProcessInfo.processInfo.environment["SUPABASE_ANON_KEY"] ?? ""
+        // Read from Keychain or env
+        if let key = ProcessInfo.processInfo.environment["SUPABASE_ANON_KEY"] {
+            return key
+        }
+        return KeychainHelper.gateway("supabase-anon-key", fallback: "")
     }()
 
     private init() {}
@@ -286,63 +288,137 @@ final class FleetEvolutionClient {
         }
     }
 
+    /// Maximum node count to prevent DAG bloat from addNode mutations.
+    static let maxDAGNodes = 15
+
+    /// Poll interval when waiting for a dispatched task to complete.
+    private static let pollIntervalNs: UInt64 = 3_000_000_000  // 3 seconds
+    /// Max polls before marking a node as failed (timeout).
+    private static let maxPollAttempts = 40  // 3s * 40 = 2 min per node
+
     /// Execute a workflow DAG by dispatching each node via the mesh.
+    /// Awaits real results from AuraGateway, populating tokenCost, latencyMs, and true pass/fail.
     func executeDAG(appId: String, dag: WorkflowDAG) async {
         var executingDAG = dag
         let app = findApp(appId)
-        let path = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
+        let rawPath = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
+        // Sanitize path — no shell metacharacters
+        let path = rawPath.replacingOccurrences(of: "\"", with: "")
 
         // Execute nodes in topological order
-        var completed = Set<String>()
-        while completed.count < executingDAG.nodes.count {
-            // Find ready nodes (all dependencies satisfied)
+        var settled = Set<String>()  // nodes that are complete, failed, or skipped
+        let maxIterations = executingDAG.nodes.count * 2  // safety bound
+        var iteration = 0
+
+        while settled.count < executingDAG.nodes.count && iteration < maxIterations {
+            iteration += 1
+
+            // Find ready nodes (all dependencies satisfied, still pending)
             let ready = executingDAG.nodes.filter { node in
                 node.status == .pending && executingDAG.canExecute(node.id)
             }
 
             guard !ready.isEmpty else {
-                // Check if we're stuck (all remaining nodes are blocked)
-                let pending = executingDAG.nodes.filter { $0.status == .pending }
-                if !pending.isEmpty {
-                    log.warning("HyEvo DAG stuck: \(pending.count) nodes can't execute for \(appId)")
+                // Mark any remaining pending nodes as skipped (unreachable due to upstream failures)
+                for i in 0..<executingDAG.nodes.count {
+                    if executingDAG.nodes[i].status == .pending {
+                        executingDAG.nodes[i].status = .skipped
+                        settled.insert(executingDAG.nodes[i].id)
+                    }
                 }
                 break
             }
 
-            // Dispatch all ready nodes concurrently
+            // Dispatch all ready nodes and await real results
             for node in ready {
                 guard let idx = executingDAG.nodes.firstIndex(where: { $0.id == node.id }) else { continue }
                 executingDAG.nodes[idx].status = .running
+                activeDAGs[appId] = executingDAG
 
+                let startTime = Date()
+
+                // Sanitize node content to prevent shell injection
+                let sanitizedContent = node.content
+                    .replacingOccurrences(of: "$(", with: "")
+                    .replacingOccurrences(of: "`", with: "")
+                    .replacingOccurrences(of: ";", with: " &&")  // chain, don't allow arbitrary separators
+
+                // Dispatch based on node type
                 switch node.type {
                 case .llm:
                     await AuraGatewayClient.shared.spawn(
-                        prompt: "cd \(path) && claude --dangerously-skip-permissions -p \"\(node.content)\"",
+                        prompt: "cd \"\(path)\" && claude --dangerously-skip-permissions -p \"\(sanitizedContent)\"",
                         target: node.model == "codex" ? "mac4" : "auto",
                         priority: 3
                     )
                 case .code:
                     await AuraGatewayClient.shared.dispatch(
-                        command: "cd \(path) && \(node.content)",
+                        command: "cd \"\(path)\" && \(sanitizedContent)",
                         target: "auto",
                         priority: 2
                     )
                 }
 
-                executingDAG.nodes[idx].status = .complete
-                completed.insert(node.id)
-            }
+                // Get the task ID from the dispatch result
+                let taskId = AuraGatewayClient.shared.lastDispatchResult?.taskId
 
-            activeDAGs[appId] = executingDAG
+                // Poll for real completion status
+                var nodeCompleted = false
+                if let taskId, !taskId.isEmpty {
+                    for _ in 0..<Self.maxPollAttempts {
+                        try? await Task.sleep(nanoseconds: Self.pollIntervalNs)
+                        await AuraGatewayClient.shared.pollStatus(taskId: taskId)
+
+                        if let status = AuraGatewayClient.shared.polledStatus {
+                            switch status.status {
+                            case "complete", "success", "done":
+                                executingDAG.nodes[idx].status = .complete
+                                executingDAG.nodes[idx].output = status.output
+                                executingDAG.nodes[idx].latencyMs = status.durationMs ?? Int(Date().timeIntervalSince(startTime) * 1000)
+                                // Estimate token cost from output length for LLM nodes
+                                if node.type == .llm {
+                                    let outputLen = status.output?.count ?? 0
+                                    executingDAG.nodes[idx].tokenCost = max(500, outputLen / 4 + 200)  // rough token estimate
+                                } else {
+                                    executingDAG.nodes[idx].tokenCost = 0
+                                }
+                                nodeCompleted = true
+
+                            case "failed", "error":
+                                executingDAG.nodes[idx].status = .failed
+                                executingDAG.nodes[idx].output = status.output ?? status.partialOutput
+                                executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
+                                executingDAG.nodes[idx].tokenCost = node.type == .llm ? 200 : 0
+                                nodeCompleted = true
+
+                            default:
+                                continue  // still running, keep polling
+                            }
+                        }
+                        if nodeCompleted { break }
+                    }
+                }
+
+                // Timeout: if polling exhausted without result, mark failed
+                if !nodeCompleted {
+                    executingDAG.nodes[idx].status = .failed
+                    executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
+                    executingDAG.nodes[idx].tokenCost = 0
+                    log.warning("HyEvo node '\(node.label)' timed out for \(appId)")
+                }
+
+                settled.insert(node.id)
+                activeDAGs[appId] = executingDAG
+            }
         }
 
-        // DAG execution complete — score fitness using HyEvo's weighted formula:
+        // ── Fitness scoring ──────────────────────────────────────────────
         // R(G) = λ₁·S_q + λ₂·U(C_q) + λ₃·U(T_q)
         // where U(x) = 1/(1 + α·x), λ₁=0.9, λ₂=0.05, λ₃=0.05
-        let lambda1 = 0.9   // quality weight
-        let lambda2 = 0.05  // cost weight
-        let lambda3 = 0.05  // latency weight
-        let alpha = 0.001   // normalization constant
+        let lambda1 = 0.9
+        let lambda2 = 0.05
+        let lambda3 = 0.05
+        let alpha = 0.001
 
         let completedCount = executingDAG.nodes.filter { $0.status == .complete }.count
         let qualityScore = Double(completedCount) / Double(max(1, executingDAG.nodes.count))
@@ -354,11 +430,13 @@ final class FleetEvolutionClient {
         executingDAG.computeFeatureVector()
         activeDAGs[appId] = executingDAG
 
-        // Update population with fitness — insert into origin island + random other
+        log.info("HyEvo DAG fitness=\(executingDAG.fitness) quality=\(qualityScore) cost=\(executingDAG.totalTokenCost) latency=\(executingDAG.totalLatencyMs)ms for \(appId)")
+
+        // ── Population update — insert into ORIGIN island only (fix #16) ──
         if var pop = populations[appId] {
-            for i in 0..<pop.islands.count {
-                pop.islands[i].insert(executingDAG)
-            }
+            // Pick the island whose strategy produced this DAG, or island 0 as default
+            let originIsland = pop.generation % pop.islands.count
+            pop.islands[originIsland].insert(executingDAG)
             pop.globalBestFitness = max(pop.globalBestFitness, executingDAG.fitness)
             pop.globalBestDAGId = pop.globalBest?.id
             populations[appId] = pop
@@ -389,14 +467,43 @@ final class FleetEvolutionClient {
             appId: appId
         )
 
-        // Dispatch reflection to LLM via AuraGateway
+        // Dispatch reflection to LLM via AuraGateway and AWAIT the response
         await AuraGatewayClient.shared.spawn(
             prompt: reflectionPrompt,
             target: "auto",
             priority: 2
         )
 
-        // Build reflection from execution data (LLM response parsed async by gateway)
+        // Poll for the LLM reflection response
+        var llmAnalysis: String?
+        var llmSuggestions: [String] = []
+        if let taskId = AuraGatewayClient.shared.lastDispatchResult?.taskId, !taskId.isEmpty {
+            for _ in 0..<Self.maxPollAttempts {
+                try? await Task.sleep(nanoseconds: Self.pollIntervalNs)
+                await AuraGatewayClient.shared.pollStatus(taskId: taskId)
+                if let status = AuraGatewayClient.shared.polledStatus,
+                   ["complete", "success", "done"].contains(status.status) {
+                    llmAnalysis = status.output
+                    // Parse suggestions from LLM output (look for bullet points or numbered lists)
+                    if let output = status.output {
+                        llmSuggestions = output.components(separatedBy: "\n")
+                            .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("-") ||
+                                      $0.trimmingCharacters(in: .whitespaces).hasPrefix("*") ||
+                                      $0.trimmingCharacters(in: .whitespaces).first?.isNumber == true }
+                            .map { $0.trimmingCharacters(in: CharacterSet.whitespaces.union(CharacterSet(charactersIn: "-*"))) }
+                            .filter { !$0.isEmpty }
+                    }
+                    break
+                }
+                if let status = AuraGatewayClient.shared.polledStatus,
+                   ["failed", "error"].contains(status.status) {
+                    log.warning("HyEvo reflection LLM failed for \(appId): \(status.output ?? "unknown")")
+                    break
+                }
+            }
+        }
+
+        // Build reflection from LLM response + execution data heuristics
         let failedNodes = executedDAG.nodes.filter { $0.status == .failed }
         let completedNodes = executedDAG.nodes.filter { $0.status == .complete }
         let failureAnalysis = failedNodes.isEmpty
@@ -404,8 +511,9 @@ final class FleetEvolutionClient {
             : "Failed nodes: \(failedNodes.map(\.label).joined(separator: ", ")). " +
               "Check timeout settings and upstream dependencies."
 
-        var suggestions: [String] = []
-        // Heuristic suggestions based on execution pattern
+        // Combine LLM suggestions with heuristic fallbacks
+        var suggestions: [String] = llmSuggestions
+        // Always add heuristic suggestions as fallback/supplement
         if executedDAG.codeNodeCount == 0 {
             suggestions.append("Add deterministic code validation nodes to offload work from LLM inference.")
         }
@@ -426,11 +534,13 @@ final class FleetEvolutionClient {
             suggestions.append("Topology looks healthy. Try minor edge rewiring to explore nearby optima.")
         }
 
+        let analysisText = llmAnalysis.map { "LLM: \($0.prefix(500))\n" } ?? ""
         let reflection = EvolutionReflection(
             generation: population.generation,
             dagId: executedDAG.id,
             fitness: executedDAG.fitness,
-            analysis: "Gen \(population.generation): fitness \(String(format: "%.3f", executedDAG.fitness)). " +
+            analysis: "\(analysisText)" +
+                "Gen \(population.generation): fitness \(String(format: "%.3f", executedDAG.fitness)). " +
                 "\(completedNodes.count)/\(executedDAG.nodes.count) nodes completed. " +
                 "LLM/Code: \(executedDAG.llmNodeCount)/\(executedDAG.codeNodeCount). " +
                 "Depth: \(executedDAG.depth). \(failureAnalysis)",
@@ -463,9 +573,14 @@ final class FleetEvolutionClient {
             var child: WorkflowDAG
             switch population.islands[i].strategy {
             case .addNode:
-                // Reflection-guided: add code node if suggestions say so, else random
-                let preferCode = suggestions.contains(where: { $0.contains("code") })
-                child = WorkflowMutations.addNode(to: parentDAG, type: preferCode ? .code : nil)
+                // Bloat guard: don't exceed max node count
+                if parentDAG.nodes.count >= Self.maxDAGNodes {
+                    child = WorkflowMutations.swapType(in: parentDAG) // mutate instead of growing
+                } else {
+                    // Reflection-guided: add code node if suggestions say so, else random
+                    let preferCode = suggestions.contains(where: { $0.contains("code") })
+                    child = WorkflowMutations.addNode(to: parentDAG, type: preferCode ? .code : nil)
+                }
             case .removeNode:
                 child = WorkflowMutations.removeNode(from: parentDAG)
             case .swapType:

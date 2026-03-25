@@ -141,7 +141,7 @@ struct WorkflowPopulation: Identifiable, Codable, Sendable {
     var startedAt: Date
     var lastEvolvedAt: Date?
 
-    init(appId: String, migrationInterval: Int = 5) {
+    init(appId: String, migrationInterval: Int = 15) {
         self.id = UUID().uuidString
         self.appId = appId
         self.generation = 0
@@ -178,12 +178,15 @@ struct WorkflowPopulation: Identifiable, Codable, Sendable {
         }
     }
 
-    /// Perform migration: copy elite from each island to all others.
+    /// Ring migration (per paper): each island sends its elite to the NEXT island only.
+    /// This preserves island diversity while spreading winning patterns gradually.
     mutating func migrate() {
-        let elites = islands.compactMap(\.elite)
+        guard islands.count >= 2 else { return }
+        let elites = islands.map(\.elite) // snapshot before mutation
         for i in 0..<islands.count {
-            for elite in elites {
-                islands[i].insert(elite)
+            let nextIsland = (i + 1) % islands.count
+            if let elite = elites[i] {
+                islands[nextIsland].insert(elite)
             }
         }
     }
