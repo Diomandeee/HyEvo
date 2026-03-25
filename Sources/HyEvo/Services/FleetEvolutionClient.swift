@@ -30,13 +30,11 @@ final class FleetEvolutionClient {
 
     // MARK: - Supabase Config
 
-    private let supabaseURL = "https://aaqbofotpchgpyuohmmz.supabase.co"
+    private let supabaseURL: String = {
+        ProcessInfo.processInfo.environment["SUPABASE_URL"] ?? "https://YOUR_PROJECT.supabase.co"
+    }()
     private let supabaseKey: String = {
-        // Read from Keychain or env
-        if let key = ProcessInfo.processInfo.environment["SUPABASE_ANON_KEY"] {
-            return key
-        }
-        return KeychainHelper.gateway("supabase-anon-key", fallback: "")
+        ProcessInfo.processInfo.environment["SUPABASE_ANON_KEY"] ?? ""
     }()
 
     private init() {}
