@@ -250,13 +250,18 @@ final class FleetEvolutionClient {
         await updateTaskInSupabase(state.tasks[idx])
     }
 
-    // MARK: - HyEvo Population Store
+    // MARK: - HyEvo Population Store (actor-isolated, fix C2/C3)
 
-    /// Per-app HyEvo populations (in-memory, synced to Supabase)
-    var populations: [String: WorkflowPopulation] = [:]
+    /// Per-app HyEvo populations — access via getPopulation/setPopulation.
+    /// Actor-isolated to prevent data races between monitor loops and UI.
+    private let hyevoStore = HyEvoStore()
 
-    /// Active DAGs being executed
-    var activeDAGs: [String: WorkflowDAG] = [:]
+    /// UI-facing snapshots updated from the actor (read-only for views).
+    var populationSnapshots: [String: WorkflowPopulation] = [:]
+    var activeDAGSnapshots: [String: WorkflowDAG] = [:]
+
+    /// Cancellable monitor tasks (fix C4/C5/C6)
+    private var monitorTasks: [String: Task<Void, Never>] = [:]
 
     // MARK: - HyEvo Pipeline
 
@@ -271,17 +276,18 @@ final class FleetEvolutionClient {
 
         var population = WorkflowPopulation(appId: appId)
         population.seed(appId: appId)
-        populations[appId] = population
+        await hyevoStore.setPopulation(appId, population)
 
         state.hyevoPopulationId = population.id
         state.hyevoIslandCount = population.islands.count
         state.hyevoTotalWorkflows = population.totalWorkflows
         state.stage = .hyevoExecuting
         states[appId] = state
+        populationSnapshots[appId] = population
 
         // Execute the initial best DAG
         if let bestDAG = population.globalBest {
-            activeDAGs[appId] = bestDAG
+            await hyevoStore.setActiveDAG(appId, bestDAG)
             state.hyevoActiveDAGId = bestDAG.id
             states[appId] = state
             await executeDAG(appId: appId, dag: bestDAG)
@@ -292,155 +298,35 @@ final class FleetEvolutionClient {
     static let maxDAGNodes = 15
 
     /// Poll interval when waiting for a dispatched task to complete.
-    private static let pollIntervalNs: UInt64 = 3_000_000_000  // 3 seconds
+    static let pollIntervalNs: UInt64 = 3_000_000_000  // 3 seconds
     /// Max polls before marking a node as failed (timeout).
-    private static let maxPollAttempts = 40  // 3s * 40 = 2 min per node
+    static let maxPollAttempts = 40  // 3s * 40 = 2 min per node
 
-    /// Execute a workflow DAG by dispatching each node via the mesh.
-    /// Awaits real results from AuraGateway, populating tokenCost, latencyMs, and true pass/fail.
+    /// Execute a workflow DAG by dispatching to the HyEvoStore actor (fix C1/C9).
+    /// Polling runs OFF the main actor. UI snapshots are updated when done.
     func executeDAG(appId: String, dag: WorkflowDAG) async {
-        var executingDAG = dag
         let app = findApp(appId)
         let rawPath = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
-        // Sanitize path — no shell metacharacters
         let path = rawPath.replacingOccurrences(of: "\"", with: "")
 
-        // Execute nodes in topological order
-        var settled = Set<String>()  // nodes that are complete, failed, or skipped
-        let maxIterations = executingDAG.nodes.count * 2  // safety bound
-        var iteration = 0
+        // Run the heavy polling loop on the actor, not the main actor
+        let scoredDAG = await hyevoStore.executeDAGInBackground(
+            appId: appId,
+            dag: dag,
+            path: path,
+            gateway: AuraGatewayClient.shared,
+            maxPollAttempts: Self.maxPollAttempts,
+            pollIntervalNs: Self.pollIntervalNs,
+            log: log
+        )
 
-        while settled.count < executingDAG.nodes.count && iteration < maxIterations {
-            iteration += 1
-
-            // Find ready nodes (all dependencies satisfied, still pending)
-            let ready = executingDAG.nodes.filter { node in
-                node.status == .pending && executingDAG.canExecute(node.id)
-            }
-
-            guard !ready.isEmpty else {
-                // Mark any remaining pending nodes as skipped (unreachable due to upstream failures)
-                for i in 0..<executingDAG.nodes.count {
-                    if executingDAG.nodes[i].status == .pending {
-                        executingDAG.nodes[i].status = .skipped
-                        settled.insert(executingDAG.nodes[i].id)
-                    }
-                }
-                break
-            }
-
-            // Dispatch all ready nodes and await real results
-            for node in ready {
-                guard let idx = executingDAG.nodes.firstIndex(where: { $0.id == node.id }) else { continue }
-                executingDAG.nodes[idx].status = .running
-                activeDAGs[appId] = executingDAG
-
-                let startTime = Date()
-
-                // Sanitize node content to prevent shell injection
-                let sanitizedContent = node.content
-                    .replacingOccurrences(of: "$(", with: "")
-                    .replacingOccurrences(of: "`", with: "")
-                    .replacingOccurrences(of: ";", with: " &&")  // chain, don't allow arbitrary separators
-
-                // Dispatch based on node type
-                switch node.type {
-                case .llm:
-                    await AuraGatewayClient.shared.spawn(
-                        prompt: "cd \"\(path)\" && claude --dangerously-skip-permissions -p \"\(sanitizedContent)\"",
-                        target: node.model == "codex" ? "mac4" : "auto",
-                        priority: 3
-                    )
-                case .code:
-                    await AuraGatewayClient.shared.dispatch(
-                        command: "cd \"\(path)\" && \(sanitizedContent)",
-                        target: "auto",
-                        priority: 2
-                    )
-                }
-
-                // Get the task ID from the dispatch result
-                let taskId = AuraGatewayClient.shared.lastDispatchResult?.taskId
-
-                // Poll for real completion status
-                var nodeCompleted = false
-                if let taskId, !taskId.isEmpty {
-                    for _ in 0..<Self.maxPollAttempts {
-                        try? await Task.sleep(nanoseconds: Self.pollIntervalNs)
-                        await AuraGatewayClient.shared.pollStatus(taskId: taskId)
-
-                        if let status = AuraGatewayClient.shared.polledStatus {
-                            switch status.status {
-                            case "complete", "success", "done":
-                                executingDAG.nodes[idx].status = .complete
-                                executingDAG.nodes[idx].output = status.output
-                                executingDAG.nodes[idx].latencyMs = status.durationMs ?? Int(Date().timeIntervalSince(startTime) * 1000)
-                                // Estimate token cost from output length for LLM nodes
-                                if node.type == .llm {
-                                    let outputLen = status.output?.count ?? 0
-                                    executingDAG.nodes[idx].tokenCost = max(500, outputLen / 4 + 200)  // rough token estimate
-                                } else {
-                                    executingDAG.nodes[idx].tokenCost = 0
-                                }
-                                nodeCompleted = true
-
-                            case "failed", "error":
-                                executingDAG.nodes[idx].status = .failed
-                                executingDAG.nodes[idx].output = status.output ?? status.partialOutput
-                                executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
-                                executingDAG.nodes[idx].tokenCost = node.type == .llm ? 200 : 0
-                                nodeCompleted = true
-
-                            default:
-                                continue  // still running, keep polling
-                            }
-                        }
-                        if nodeCompleted { break }
-                    }
-                }
-
-                // Timeout: if polling exhausted without result, mark failed
-                if !nodeCompleted {
-                    executingDAG.nodes[idx].status = .failed
-                    executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
-                    executingDAG.nodes[idx].tokenCost = 0
-                    log.warning("HyEvo node '\(node.label)' timed out for \(appId)")
-                }
-
-                settled.insert(node.id)
-                activeDAGs[appId] = executingDAG
-            }
+        // Update UI-facing snapshots on MainActor
+        activeDAGSnapshots[appId] = scoredDAG
+        if let pop = await hyevoStore.getPopulation(appId) {
+            populationSnapshots[appId] = pop
         }
 
-        // ── Fitness scoring ──────────────────────────────────────────────
-        // R(G) = λ₁·S_q + λ₂·U(C_q) + λ₃·U(T_q)
-        // where U(x) = 1/(1 + α·x), λ₁=0.9, λ₂=0.05, λ₃=0.05
-        let lambda1 = 0.9
-        let lambda2 = 0.05
-        let lambda3 = 0.05
-        let alpha = 0.001
-
-        let completedCount = executingDAG.nodes.filter { $0.status == .complete }.count
-        let qualityScore = Double(completedCount) / Double(max(1, executingDAG.nodes.count))
-        let costUtility = 1.0 / (1.0 + alpha * Double(executingDAG.totalTokenCost))
-        let latencyUtility = 1.0 / (1.0 + alpha * Double(executingDAG.totalLatencyMs))
-
-        executingDAG.fitness = lambda1 * qualityScore + lambda2 * costUtility + lambda3 * latencyUtility
-        executingDAG.efficiency = costUtility
-        executingDAG.computeFeatureVector()
-        activeDAGs[appId] = executingDAG
-
-        log.info("HyEvo DAG fitness=\(executingDAG.fitness) quality=\(qualityScore) cost=\(executingDAG.totalTokenCost) latency=\(executingDAG.totalLatencyMs)ms for \(appId)")
-
-        // ── Population update — insert into ORIGIN island only (fix #16) ──
-        if var pop = populations[appId] {
-            // Pick the island whose strategy produced this DAG, or island 0 as default
-            let originIsland = pop.generation % pop.islands.count
-            pop.islands[originIsland].insert(executingDAG)
-            pop.globalBestFitness = max(pop.globalBestFitness, executingDAG.fitness)
-            pop.globalBestDAGId = pop.globalBest?.id
-            populations[appId] = pop
-        }
+        log.info("HyEvo DAG fitness=\(scoredDAG.fitness) cost=\(scoredDAG.totalTokenCost) latency=\(scoredDAG.totalLatencyMs)ms for \(appId)")
     }
 
     /// Reflect-then-generate: LLM analyzes execution feedback, then evolves the population.
@@ -452,8 +338,8 @@ final class FleetEvolutionClient {
     /// Phase 2 (Generate): Apply mutations informed by the reflection to each island.
     func reflectAndEvolve(appId: String) async {
         guard var state = states[appId],
-              var population = populations[appId],
-              let executedDAG = activeDAGs[appId] else { return }
+              var population = await hyevoStore.getPopulation(appId),
+              let executedDAG = await hyevoStore.getActiveDAG(appId) else { return }
 
         // ── Phase 1: Reflect ──────────────────────────────────────────────
         state.stage = .hyevoReflecting
@@ -626,8 +512,10 @@ final class FleetEvolutionClient {
             state.stage = .hyevoExecuting
         }
 
-        populations[appId] = population
         population.lastEvolvedAt = Date()
+        await hyevoStore.setPopulation(appId, population)
+        populationSnapshots[appId] = population
+        activeDAGSnapshots[appId] = executedDAG
         states[appId] = state
         await syncStateToSupabase(state)
         await syncDAGToSupabase(executedDAG, appId: appId)
@@ -793,8 +681,8 @@ final class FleetEvolutionClient {
 
         switch state.stage {
         case .hyevoExecuting:
-            if let dag = populations[appId]?.globalBest {
-                activeDAGs[appId] = dag
+            if let dag = await hyevoStore.globalBest(appId) {
+                await hyevoStore.setActiveDAG(appId, dag)
                 await executeDAG(appId: appId, dag: dag)
                 await reflectAndEvolve(appId: appId)
             }
@@ -805,18 +693,29 @@ final class FleetEvolutionClient {
         }
     }
 
-    /// Start the HyEvo evolution monitor loop (runs generations until complete).
+    /// Start the HyEvo evolution monitor loop with cancellation support (fix C4/C5).
     func startHyEvoMonitor(appId: String) {
-        Task { [weak self] in
+        // Cancel any existing monitor for this app
+        monitorTasks[appId]?.cancel()
+
+        let task = Task { [weak self] in
             guard let self else { return }
             log.info("HyEvo monitor started for \(appId)")
-            while let state = states[appId],
-                  state.stage.phase == .hyevo {
+            while !Task.isCancelled {
+                guard let state = states[appId],
+                      state.stage.phase == .hyevo else { break }
                 await hyevoStep(appId: appId)
-                try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s between generations
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
             log.info("HyEvo monitor ended for \(appId) at generation \(states[appId]?.hyevoGeneration ?? 0)")
         }
+        monitorTasks[appId] = task
+    }
+
+    /// Stop the HyEvo monitor for an app (called on navigation away or completion).
+    func stopHyEvoMonitor(appId: String) {
+        monitorTasks[appId]?.cancel()
+        monitorTasks.removeValue(forKey: appId)
     }
 
     // MARK: - Dispatch Helpers
@@ -836,29 +735,31 @@ final class FleetEvolutionClient {
 
     // MARK: - Hydra Bridge
 
-    /// Polls Hydra quality gate while app is in Hydra phase (foreground only).
-    /// Python orchestrator handles backgrounded polling via Prefect.
+    /// Polls Hydra quality gate with cancellation support (fix C6).
     func startHydraMonitor(appId: String) {
-        Task { [weak self] in
+        let monitorKey = "hydra-\(appId)"
+        monitorTasks[monitorKey]?.cancel()
+
+        let task = Task { [weak self] in
             guard let self else { return }
             log.info("Hydra monitor started for \(appId)")
-            while let state = states[appId], state.stage.phase == .hydra {
-                try? await Task.sleep(nanoseconds: 10_000_000_000) // 10s
+            while !Task.isCancelled {
+                guard let state = states[appId], state.stage.phase == .hydra else { break }
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled else { break }
+
                 await HydraClient.shared.refresh()
                 let hydra = HydraClient.shared
 
-                // Map Hydra phase → EvolutionStage
                 let mapped = EvolutionStage.fromHydraPhase(hydra.currentPhase.rawValue, cycle: hydra.currentCycle)
                 if var current = states[appId], current.stage != mapped {
                     current.stage = mapped
                     current.hydraCycle = hydra.currentCycle
                     states[appId] = current
-                    // Note: Python orchestrator is the authoritative writer to Supabase.
-                    // Swift updates UI immediately; DB stays consistent via Python.
                 }
 
                 if hydra.qualityGate.isPassing {
-                    log.info("Hydra quality PASSING for \(appId) — updating UI")
+                    log.info("Hydra quality PASSING for \(appId)")
                     if var current = states[appId] {
                         current.stage = .complete
                         current.completedAt = Date()
@@ -868,6 +769,13 @@ final class FleetEvolutionClient {
                 }
             }
         }
+        monitorTasks[monitorKey] = task
+    }
+
+    func stopHydraMonitor(appId: String) {
+        let monitorKey = "hydra-\(appId)"
+        monitorTasks[monitorKey]?.cancel()
+        monitorTasks.removeValue(forKey: monitorKey)
     }
 
     private var log: Logger { Logger(subsystem: "MeshControl", category: "FleetEvolution") }
@@ -1023,6 +931,156 @@ final class FleetEvolutionClient {
         guard total > 0 else { return 0 }
         let sum = states.values.reduce(0.0) { $0 + $1.overallProgress }
         return sum / Double(total)
+    }
+}
+
+// MARK: - HyEvo Actor Store (fix C2/C3)
+
+/// Thread-safe store for HyEvo populations and active DAGs.
+/// All mutation happens inside this actor; FleetEvolutionClient reads
+/// snapshots on the MainActor for UI binding.
+actor HyEvoStore {
+    var populations: [String: WorkflowPopulation] = [:]
+    var activeDAGs: [String: WorkflowDAG] = [:]
+
+    func getPopulation(_ appId: String) -> WorkflowPopulation? { populations[appId] }
+    func setPopulation(_ appId: String, _ pop: WorkflowPopulation) { populations[appId] = pop }
+
+    func getActiveDAG(_ appId: String) -> WorkflowDAG? { activeDAGs[appId] }
+    func setActiveDAG(_ appId: String, _ dag: WorkflowDAG) { activeDAGs[appId] = dag }
+
+    func globalBest(_ appId: String) -> WorkflowDAG? { populations[appId]?.globalBest }
+
+    /// Execute the full DAG polling loop OFF the main actor (fix C1/C9).
+    /// Returns the scored DAG with real fitness, latency, and token cost.
+    func executeDAGInBackground(
+        appId: String,
+        dag: WorkflowDAG,
+        path: String,
+        gateway: AuraGatewayClient,
+        maxPollAttempts: Int,
+        pollIntervalNs: UInt64,
+        log: Logger
+    ) async -> WorkflowDAG {
+        var executingDAG = dag
+        var settled = Set<String>()
+        let maxIterations = executingDAG.nodes.count * 2
+
+        for iteration in 0..<maxIterations {
+            guard settled.count < executingDAG.nodes.count else { break }
+
+            let ready = executingDAG.nodes.filter { node in
+                node.status == .pending && executingDAG.canExecute(node.id)
+            }
+
+            guard !ready.isEmpty else {
+                for i in 0..<executingDAG.nodes.count {
+                    if executingDAG.nodes[i].status == .pending {
+                        executingDAG.nodes[i].status = .skipped
+                        settled.insert(executingDAG.nodes[i].id)
+                    }
+                }
+                break
+            }
+
+            for node in ready {
+                guard let idx = executingDAG.nodes.firstIndex(where: { $0.id == node.id }) else { continue }
+                executingDAG.nodes[idx].status = .running
+                activeDAGs[appId] = executingDAG
+
+                let startTime = Date()
+                let sanitizedContent = node.content
+                    .replacingOccurrences(of: "$(", with: "")
+                    .replacingOccurrences(of: "`", with: "")
+                    .replacingOccurrences(of: ";", with: " &&")
+                    .replacingOccurrences(of: "|", with: "")
+                    .replacingOccurrences(of: ">", with: "")
+                    .replacingOccurrences(of: "<", with: "")
+                    .replacingOccurrences(of: "\n", with: " ")
+
+                // Dispatch via gateway (awaits the HTTP call, not the full execution)
+                switch node.type {
+                case .llm:
+                    await gateway.spawn(
+                        prompt: "cd \"\(path)\" && claude --dangerously-skip-permissions -p \"\(sanitizedContent)\"",
+                        target: node.model == "codex" ? "mac4" : "auto",
+                        priority: 3
+                    )
+                case .code:
+                    await gateway.dispatch(
+                        command: "cd \"\(path)\" && \(sanitizedContent)",
+                        target: "auto",
+                        priority: 2
+                    )
+                }
+
+                let taskId = await gateway.lastDispatchResult?.taskId
+
+                // Poll for real completion
+                var nodeCompleted = false
+                if let taskId, !taskId.isEmpty {
+                    for _ in 0..<maxPollAttempts {
+                        try? await Task.sleep(nanoseconds: pollIntervalNs)
+                        await gateway.pollStatus(taskId: taskId)
+
+                        if let status = await gateway.polledStatus {
+                            switch status.status {
+                            case "complete", "success", "done":
+                                executingDAG.nodes[idx].status = .complete
+                                executingDAG.nodes[idx].output = status.output
+                                executingDAG.nodes[idx].latencyMs = status.durationMs ?? Int(Date().timeIntervalSince(startTime) * 1000)
+                                executingDAG.nodes[idx].tokenCost = node.type == .llm
+                                    ? max(500, (status.output?.count ?? 0) / 4 + 200)
+                                    : 0
+                                nodeCompleted = true
+                            case "failed", "error":
+                                executingDAG.nodes[idx].status = .failed
+                                executingDAG.nodes[idx].output = status.output ?? status.partialOutput
+                                executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
+                                executingDAG.nodes[idx].tokenCost = node.type == .llm ? 200 : 0
+                                nodeCompleted = true
+                            default:
+                                continue
+                            }
+                        }
+                        if nodeCompleted { break }
+                    }
+                }
+
+                if !nodeCompleted {
+                    executingDAG.nodes[idx].status = .failed
+                    executingDAG.nodes[idx].latencyMs = Int(Date().timeIntervalSince(startTime) * 1000)
+                    executingDAG.nodes[idx].tokenCost = 0
+                    log.warning("HyEvo node '\(node.label)' timed out for \(appId)")
+                }
+
+                settled.insert(node.id)
+                activeDAGs[appId] = executingDAG
+            }
+        }
+
+        // Score fitness
+        let lambda1 = 0.9, lambda2 = 0.05, lambda3 = 0.05, alpha = 0.001
+        let completedCount = executingDAG.nodes.filter { $0.status == .complete }.count
+        let qualityScore = Double(completedCount) / Double(max(1, executingDAG.nodes.count))
+        let costUtility = 1.0 / (1.0 + alpha * Double(executingDAG.totalTokenCost))
+        let latencyUtility = 1.0 / (1.0 + alpha * Double(executingDAG.totalLatencyMs))
+
+        executingDAG.fitness = lambda1 * qualityScore + lambda2 * costUtility + lambda3 * latencyUtility
+        executingDAG.efficiency = costUtility
+        executingDAG.computeFeatureVector()
+        activeDAGs[appId] = executingDAG
+
+        // Insert into origin island only
+        if var pop = populations[appId] {
+            let originIsland = pop.generation % pop.islands.count
+            pop.islands[originIsland].insert(executingDAG)
+            pop.globalBestFitness = max(pop.globalBestFitness, executingDAG.fitness)
+            pop.globalBestDAGId = pop.globalBest?.id
+            populations[appId] = pop
+        }
+
+        return executingDAG
     }
 }
 

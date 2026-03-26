@@ -380,9 +380,9 @@ struct AppEvolutionDetailSheet: View {
 
                     // HyEvo DAG Visualization
                     if state.pipeline == .hyevo {
-                        let dag = FleetEvolutionClient.shared.activeDAGs[state.id]
+                        let dag = FleetEvolutionClient.shared.activeDAGSnapshots[state.id]
                             ?? WorkflowDAG.linearSeed(appId: state.id)
-                        let pop = FleetEvolutionClient.shared.populations[state.id]
+                        let pop = FleetEvolutionClient.shared.populationSnapshots[state.id]
                         VStack(alignment: .leading, spacing: 8) {
                             Text("Workflow DAG")
                                 .font(.headline)
