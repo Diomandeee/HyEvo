@@ -100,15 +100,14 @@ final class FleetEvolutionClient {
         states[appId] = state
 
         // Dispatch the skill via AuraGateway
-        let app = findApp(appId)
-        let path = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
-        let expandedPath = path.hasPrefix("~/")
-            ? NSHomeDirectory() + path.dropFirst(1)
-            : path
+        guard let expandedPath = sanitizedPath(for: appId) else {
+            await markFailed(appId: appId, error: "Path validation failed for \(appId)")
+            return
+        }
 
         let prompt = buildSkillPrompt(state: state, path: expandedPath)
         await AuraGatewayClient.shared.spawn(
-            prompt: "cd \(expandedPath) && claude --dangerously-skip-permissions -p \"\(prompt)\"",
+            prompt: "cd \"\(expandedPath)\" && claude --dangerously-skip-permissions -p \"\(prompt)\"",
             target: "auto",
             priority: 3
         )
@@ -305,9 +304,10 @@ final class FleetEvolutionClient {
     /// Execute a workflow DAG by dispatching to the HyEvoStore actor (fix C1/C9).
     /// Polling runs OFF the main actor. UI snapshots are updated when done.
     func executeDAG(appId: String, dag: WorkflowDAG) async {
-        let app = findApp(appId)
-        let rawPath = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
-        let path = rawPath.replacingOccurrences(of: "\"", with: "")
+        guard let path = sanitizedPath(for: appId) else {
+            log.error("Path validation failed for \(appId), skipping DAG execution")
+            return
+        }
 
         // Run the heavy polling loop on the actor, not the main actor
         let scoredDAG = await hyevoStore.executeDAGInBackground(
@@ -520,6 +520,19 @@ final class FleetEvolutionClient {
         await syncStateToSupabase(state)
         await syncDAGToSupabase(executedDAG, appId: appId)
         await syncReflectionToSupabase(reflection, appId: appId)
+
+        // P6: Evict completed population snapshots when memory grows too large
+        if populationSnapshots.count > 20 {
+            let completedAppIds = populationSnapshots.keys.filter { id in
+                states[id]?.stage == .complete || states[id]?.stage == .adversarialPending
+            }
+            // Remove oldest completed snapshots until we're at 20
+            for id in completedAppIds {
+                guard populationSnapshots.count > 20 else { break }
+                populationSnapshots.removeValue(forKey: id)
+                activeDAGSnapshots.removeValue(forKey: id)
+            }
+        }
     }
 
     /// Build the reflection prompt for the meta-agent.
@@ -900,6 +913,22 @@ final class FleetEvolutionClient {
     }
 
     // MARK: - Helpers
+
+    /// Resolve and validate the filesystem path for an app.
+    /// Returns nil if the path contains traversal sequences or escapes the home directory.
+    private func sanitizedPath(for appId: String) -> String? {
+        let app = findApp(appId)
+        let rawPath = app?.iosPath ?? app?.webPath ?? "~/Desktop/\(appId)/"
+        let expanded = rawPath.hasPrefix("~/")
+            ? NSHomeDirectory() + String(rawPath.dropFirst(1))
+            : rawPath
+        // Reject traversal attempts and paths outside the home directory
+        guard !expanded.contains(".."),
+              expanded.hasPrefix(NSHomeDirectory()) else {
+            return nil
+        }
+        return expanded.replacingOccurrences(of: "\"", with: "")
+    }
 
     private func findApp(_ id: String) -> AppAgent? {
         for agent in AppAgent.fleet {

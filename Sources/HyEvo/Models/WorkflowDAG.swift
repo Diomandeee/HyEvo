@@ -175,15 +175,30 @@ struct WorkflowDAG: Identifiable, Codable, Sendable {
         return nodes.filter { sourceIds.contains($0.id) }
     }
 
+    /// Pre-built incoming edge index for O(1) dependency lookups in canExecute.
+    private var incomingEdges: [String: [(sourceId: String, condition: WorkflowEdge.EdgeCondition)]] {
+        var idx: [String: [(String, WorkflowEdge.EdgeCondition)]] = [:]
+        for edge in edges {
+            idx[edge.targetId, default: []].append((edge.sourceId, edge.condition))
+        }
+        return idx
+    }
+
+    /// Node lookup by ID for O(1) status checks.
+    private var nodeIndex: [String: WorkflowNode] {
+        Dictionary(uniqueKeysWithValues: nodes.map { ($0.id, $0) })
+    }
+
     /// Whether all upstream dependencies of a node are complete.
     func canExecute(_ nodeId: String) -> Bool {
-        let deps = upstream(of: nodeId)
-        return deps.allSatisfy { node in
-            let edge = edges.first { $0.sourceId == node.id && $0.targetId == nodeId }
-            switch edge?.condition ?? .always {
-            case .always:    return node.status == .complete || node.status == .failed
-            case .onSuccess: return node.status == .complete
-            case .onFailure: return node.status == .failed
+        let incoming = incomingEdges[nodeId] ?? []
+        let lookup = nodeIndex
+        return incoming.allSatisfy { (sourceId, condition) in
+            guard let source = lookup[sourceId] else { return true }
+            switch condition {
+            case .always:    return source.status == .complete || source.status == .failed
+            case .onSuccess: return source.status == .complete
+            case .onFailure: return source.status == .failed
             }
         }
     }
@@ -225,17 +240,19 @@ struct WorkflowDAG: Identifiable, Codable, Sendable {
     // MARK: - Feature Vector
 
     /// Compute the MAP-Elites feature vector for this DAG.
-    /// Dimensions: [llmRatio, depth, edgeDensity]
+    /// Dimensions: [llmRatio, normalizedDepth, edgeDensity, rawDepth]
+    /// rawDepth (index 3) is included so callers can read it without recomputing.
     mutating func computeFeatureVector() {
         guard !nodes.isEmpty else {
-            featureVector = [0, 0, 0]
+            featureVector = [0, 0, 0, 0]
             return
         }
         let llmRatio = Double(llmNodeCount) / Double(nodes.count)
-        let normalizedDepth = min(Double(depth) / 10.0, 1.0)
+        let depthVal = depth  // compute once
+        let normalizedDepth = min(Double(depthVal) / 10.0, 1.0)
         let maxEdges = Double(nodes.count * (nodes.count - 1)) / 2.0
         let edgeDensity = maxEdges > 0 ? Double(edges.count) / maxEdges : 0
-        featureVector = [llmRatio, normalizedDepth, edgeDensity]
+        featureVector = [llmRatio, normalizedDepth, edgeDensity, Double(depthVal)]
     }
 
     // MARK: - Validation
