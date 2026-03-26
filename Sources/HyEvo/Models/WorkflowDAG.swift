@@ -240,24 +240,49 @@ struct WorkflowDAG: Identifiable, Codable, Sendable {
 
     // MARK: - Validation
 
-    /// Check for cycles (must be acyclic).
+    /// Check for cycles using iterative DFS (fix P1 — no stack overflow risk).
     var isAcyclic: Bool {
-        var visited = Set<String>()
-        var stack = Set<String>()
-
-        func dfs(_ nodeId: String) -> Bool {
-            if stack.contains(nodeId) { return false } // cycle
-            if visited.contains(nodeId) { return true }
-            visited.insert(nodeId)
-            stack.insert(nodeId)
-            for next in downstream(of: nodeId) {
-                if !dfs(next.id) { return false }
-            }
-            stack.remove(nodeId)
-            return true
+        // Build adjacency list once for O(1) lookups
+        var adj: [String: [String]] = [:]
+        for edge in edges {
+            adj[edge.sourceId, default: []].append(edge.targetId)
         }
 
-        return nodes.allSatisfy { dfs($0.id) }
+        var visited = Set<String>()
+        var inStack = Set<String>()
+
+        for node in nodes {
+            guard !visited.contains(node.id) else { continue }
+
+            // Iterative DFS with explicit stack: (nodeId, childIteratorIndex)
+            var dfsStack: [(id: String, childIdx: Int)] = [(node.id, 0)]
+            inStack.insert(node.id)
+
+            while !dfsStack.isEmpty {
+                let (currentId, childIdx) = dfsStack.last!
+                let children = adj[currentId] ?? []
+
+                if childIdx < children.count {
+                    // Advance iterator
+                    dfsStack[dfsStack.count - 1].childIdx += 1
+                    let childId = children[childIdx]
+
+                    if inStack.contains(childId) {
+                        return false // cycle detected
+                    }
+                    if !visited.contains(childId) {
+                        inStack.insert(childId)
+                        dfsStack.append((childId, 0))
+                    }
+                } else {
+                    // All children processed — backtrack
+                    visited.insert(currentId)
+                    inStack.remove(currentId)
+                    dfsStack.removeLast()
+                }
+            }
+        }
+        return true
     }
 }
 

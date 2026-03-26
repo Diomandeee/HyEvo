@@ -19,9 +19,11 @@ struct MAPElitesCell: Codable, Sendable {
     }
 
     /// Discretize a continuous feature vector into grid coordinates.
-    /// Each dimension is bucketed into 5 bins (0.0-0.2, 0.2-0.4, ...).
+    /// Each dimension is bucketed into 5 bins [0..4]. Locale-invariant integer keys.
     static func key(for features: [Double]) -> String {
-        features.map { String(format: "%.1f", (Double(Int($0 * 5)) / 5.0)) }.joined(separator: "-")
+        features.map { f in
+            String(min(4, max(0, Int(f * 5))))
+        }.joined(separator: "-")
     }
 }
 
@@ -159,6 +161,7 @@ struct WorkflowPopulation: Identifiable, Codable, Sendable {
     }
 
     /// Seed the population with initial workflow topologies.
+    /// Seeds get fitness 0 — real fitness is assigned only after execution (fix G5).
     mutating func seed(appId: String) {
         let seeds = [
             WorkflowDAG.linearSeed(appId: appId),
@@ -166,14 +169,14 @@ struct WorkflowPopulation: Identifiable, Codable, Sendable {
             WorkflowDAG.iterativeSeed(appId: appId),
         ]
 
-        // Distribute seeds across islands
-        for (i, seed) in seeds.enumerated() {
+        // Distribute seeds across islands with zero fitness.
+        // First executeDAG() call will score them with real metrics.
+        for seed in seeds {
             for j in 0..<islands.count {
-                var mutated = seed
-                mutated.generation = 0
-                // Give each seed a slight fitness variation so MAP-Elites has something to work with
-                mutated.fitness = Double.random(in: 0.3...0.5)
-                islands[j].insert(mutated)
+                var s = seed
+                s.generation = 0
+                s.fitness = 0  // No fake fitness — must be earned via execution
+                islands[j].insert(s)
             }
         }
     }
@@ -279,8 +282,9 @@ enum WorkflowMutations {
     }
 
     /// Remove a random non-entry, non-exit node from the DAG.
+    /// Requires at least 4 nodes so the result has >= 3 (fix G4).
     static func removeNode(from dag: WorkflowDAG) -> WorkflowDAG {
-        guard dag.nodes.count > 2 else { return dag }
+        guard dag.nodes.count > 3 else { return dag }
         var mutated = dag
 
         // Pick a random non-entry, non-exit node
@@ -346,40 +350,95 @@ enum WorkflowMutations {
         return dag // reject cyclic mutation
     }
 
-    /// Crossover: merge topology from two parent DAGs.
+    /// Crossover: merge topology from two parent DAGs using topological depth split (fix G3).
+    /// Takes shallow layers from parent A and deep layers from parent B,
+    /// then bridges them and ensures all nodes are reachable (fix G7).
     static func crossover(_ a: WorkflowDAG, _ b: WorkflowDAG) -> WorkflowDAG {
         var child = WorkflowDAG(
             name: "\(a.name)-x-\(b.name)",
             generation: max(a.generation, b.generation) + 1
         )
 
-        // Take first half of nodes from parent A, second half from parent B
-        let splitA = a.nodes.count / 2
-        let splitB = b.nodes.count / 2
-        let nodesA = Array(a.nodes.prefix(max(1, splitA)))
-        let nodesB = Array(b.nodes.suffix(max(1, splitB)))
+        // Compute depth of each node in both parents
+        let aDepths = nodeDepths(a)
+        let bDepths = nodeDepths(b)
+        let aMaxDepth = aDepths.values.max() ?? 0
+        let bMaxDepth = bDepths.values.max() ?? 0
+
+        // Take shallow half from A (depth < midpoint), deep half from B
+        let aSplitDepth = max(1, aMaxDepth / 2)
+        let bSplitDepth = max(1, bMaxDepth / 2)
+
+        let shallowA = a.nodes.filter { (aDepths[$0.id] ?? 0) < aSplitDepth }
+        let deepB = b.nodes.filter { (bDepths[$0.id] ?? 0) >= bSplitDepth }
+
+        // Ensure we have at least 1 node from each parent
+        let nodesA = shallowA.isEmpty ? Array(a.nodes.prefix(1)) : shallowA
+        let nodesB = deepB.isEmpty ? Array(b.nodes.suffix(1)) : deepB
+
         child.nodes = nodesA + nodesB
+        let childNodeIds = Set(child.nodes.map(\.id))
 
-        // Connect A's last to B's first
-        let nodeIds = Set(child.nodes.map(\.id))
-
-        // Keep valid edges from both parents
-        let validEdgesA = a.edges.filter { nodeIds.contains($0.sourceId) && nodeIds.contains($0.targetId) }
-        let validEdgesB = b.edges.filter { nodeIds.contains($0.sourceId) && nodeIds.contains($0.targetId) }
+        // Keep valid edges from both parents (both endpoints must exist in child)
+        let validEdgesA = a.edges.filter { childNodeIds.contains($0.sourceId) && childNodeIds.contains($0.targetId) }
+        let validEdgesB = b.edges.filter { childNodeIds.contains($0.sourceId) && childNodeIds.contains($0.targetId) }
         child.edges = validEdgesA + validEdgesB
 
-        // Bridge the two halves
-        if let lastA = nodesA.last, let firstB = nodesB.first {
-            child.edges.append(WorkflowEdge(from: lastA.id, to: firstB.id))
+        // Bridge: connect deepest A node to shallowest B node
+        let deepestA = nodesA.max(by: { (aDepths[$0.id] ?? 0) < (aDepths[$1.id] ?? 0) })
+        let shallowestB = nodesB.min(by: { (bDepths[$0.id] ?? 0) < (bDepths[$1.id] ?? 0) })
+        if let from = deepestA, let to = shallowestB {
+            child.edges.append(WorkflowEdge(from: from.id, to: to.id))
+        }
+
+        // Reachability fix (G7): ensure all nodes are reachable from entry nodes
+        let entryIds = Set(child.entryNodes.map(\.id))
+        let reachable = reachableNodes(from: entryIds, edges: child.edges)
+        let unreachable = childNodeIds.subtracting(reachable)
+        if !unreachable.isEmpty, let bridgeSource = deepestA ?? nodesA.last {
+            for nodeId in unreachable {
+                child.edges.append(WorkflowEdge(from: bridgeSource.id, to: nodeId))
+            }
         }
 
         child.parentIds = [a.id, b.id]
 
-        // Validate acyclic
+        // Validate acyclic — if cyclic, fall back to simple mutation
         if child.isAcyclic {
             return child
         }
-        // Fallback: return parent A mutated
         return addNode(to: a)
+    }
+
+    // MARK: - Crossover Helpers
+
+    /// Compute depth of each node in a DAG (distance from entry nodes).
+    private static func nodeDepths(_ dag: WorkflowDAG) -> [String: Int] {
+        var depths: [String: Int] = [:]
+        func depthOf(_ nodeId: String) -> Int {
+            if let cached = depths[nodeId] { return cached }
+            let parents = dag.upstream(of: nodeId)
+            let d = parents.isEmpty ? 0 : parents.map { depthOf($0.id) }.max()! + 1
+            depths[nodeId] = d
+            return d
+        }
+        for node in dag.nodes { _ = depthOf(node.id) }
+        return depths
+    }
+
+    /// BFS reachability from a set of start nodes.
+    private static func reachableNodes(from startIds: Set<String>, edges: [WorkflowEdge]) -> Set<String> {
+        var visited = startIds
+        var queue = Array(startIds)
+        while !queue.isEmpty {
+            let current = queue.removeFirst()
+            for edge in edges where edge.sourceId == current {
+                if !visited.contains(edge.targetId) {
+                    visited.insert(edge.targetId)
+                    queue.append(edge.targetId)
+                }
+            }
+        }
+        return visited
     }
 }
